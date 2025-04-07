@@ -10,6 +10,9 @@ from typing import List, Dict, Tuple, Any, Optional, Union
 import logging
 from datetime import datetime
 
+# Import EnhancedJudgeAgent instead of using internal JudgeAgent
+from enhanced_judge_agent import EnhancedJudgeAgent
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +33,7 @@ class EnhancedMultiAgentFAQMapper:
     and uses a sophisticated reranking and judging system.
     """
     
-    def __init__(self, faqs_df, test_df, use_memory=True, use_self_improvement=True):
+    def __init__(self, faqs_df, test_df, use_memory=True, use_self_improvement=True, judge_agent=None, memory_system=None):
         """
         Initialize the enhanced multi-agent FAQ mapper.
         
@@ -39,23 +42,28 @@ class EnhancedMultiAgentFAQMapper:
             test_df: DataFrame containing the test utterances, FAQs, and ranks
             use_memory: Whether to use memory for improving over time
             use_self_improvement: Whether to use self-improvement mechanisms
+            judge_agent: Optional external judge agent instance to use
+            memory_system: Optional external memory system instance to use
         """
         self.faqs_df = faqs_df
         self.test_df = test_df
         self.use_memory = use_memory
         self.use_self_improvement = use_self_improvement
+        self.external_judge = judge_agent
+        self.external_memory = memory_system
         
         # Initialize the agent network
         self.agents = []
         self.rerankers = []
         self.agent_weights = {}  # For potential weighted ensemble
         
-        # Memory system for tracking successful mappings
-        self.memory = {
-            'successful_mappings': [],
-            'workflow_patterns': {},
-            'performance_metrics': {}
-        }
+        # Internal memory if no external system provided
+        if not self.external_memory:
+            self.memory = {
+                'successful_mappings': [],
+                'workflow_patterns': {},
+                'performance_metrics': {}
+            }
         
         # Initialize the agents and components
         self.initialize_components()
@@ -135,8 +143,18 @@ class EnhancedMultiAgentFAQMapper:
         """
         logger.info("Initializing enhanced judge component...")
         
-        # Create the judge component
-        self.judge = JudgeAgent(self.faqs_df, self.test_df)
+        # Use provided judge agent or create a new one
+        if self.external_judge:
+            self.judge = self.external_judge
+            logger.info("Using external judge agent")
+        else:
+            # Create the enhanced judge component
+            self.judge = EnhancedJudgeAgent(
+                faqs_df=self.faqs_df, 
+                test_df=self.test_df,
+                judge_consistency=self.use_self_improvement
+            )
+            logger.info("Created new judge agent")
     
     def _initialize_memory_system(self):
         """
@@ -144,15 +162,17 @@ class EnhancedMultiAgentFAQMapper:
         """
         logger.info("Initializing memory system...")
         
-        # Load existing memory if available
-        memory_path = "faq_mapping_memory.json"
-        if os.path.exists(memory_path):
-            try:
-                with open(memory_path, 'r') as f:
-                    self.memory = json.load(f)
-                logger.info(f"Loaded {len(self.memory['successful_mappings'])} previous mappings from memory")
-            except Exception as e:
-                logger.error(f"Error loading memory: {e}")
+        # External memory system is already initialized in __init__
+        if not self.external_memory and self.use_memory:
+            # Load existing memory if available
+            memory_path = "faq_mapping_memory.json"
+            if os.path.exists(memory_path):
+                try:
+                    with open(memory_path, 'r') as f:
+                        self.memory = json.load(f)
+                    logger.info(f"Loaded {len(self.memory['successful_mappings'])} previous mappings from memory")
+                except Exception as e:
+                    logger.error(f"Error loading memory: {e}")
     
     def _initialize_query_planner(self):
         """
@@ -198,6 +218,7 @@ class EnhancedMultiAgentFAQMapper:
             A dictionary containing detailed mapping information if return_details is True
         """
         start_time = time.time()
+        self.start_time = start_time  # Store for memory system
         
         # 1. Query Planning
         logger.info(f"Planning query: '{utterance}'")
@@ -329,12 +350,18 @@ class EnhancedMultiAgentFAQMapper:
             logger.error(f"Error in response generation: {e}")
             response_info = {"response": "An error occurred while generating the response."}
         
+        # Calculate the processing time
+        processing_time = time.time() - start_time
+        
         # 6. Update Memory System if enabled
         if self.use_memory and final_ranked_faqs:
-            self._update_memory(utterance, expanded_query, final_ranked_faqs, agent_predictions, reranker_results)
+            self._update_memory(
+                utterance, expanded_query, final_ranked_faqs, 
+                agent_predictions, reranker_results, 
+                processing_time=processing_time
+            )
         
         # Return the results
-        processing_time = time.time() - start_time
         logger.info(f"Total processing time: {processing_time:.2f} seconds")
         
         if return_details:
@@ -350,7 +377,7 @@ class EnhancedMultiAgentFAQMapper:
         else:
             return final_ranked_faqs[:5]  # Return top 5
     
-    def _update_memory(self, original_query, expanded_query, final_ranked_faqs, agent_predictions, reranker_results):
+    def _update_memory(self, original_query, expanded_query, final_ranked_faqs, agent_predictions, reranker_results, processing_time=None):
         """
         Update the memory system with the current mapping.
         
@@ -360,33 +387,71 @@ class EnhancedMultiAgentFAQMapper:
             final_ranked_faqs: The final ranked FAQs
             agent_predictions: The predictions from each agent
             reranker_results: The results from each reranker
+            processing_time: The processing time for this mapping
         """
-        # Record the mapping in memory
-        mapping_record = {
-            'timestamp': datetime.now().isoformat(),
-            'original_query': original_query,
-            'expanded_query': expanded_query,
-            'final_ranked_faqs': final_ranked_faqs[:5],  # Store top 5 results
-            'best_performing_agents': self._identify_best_agents(final_ranked_faqs, agent_predictions),
-            'workflow_pattern': {
-                'query_expansion_successful': original_query != expanded_query,
-                'agent_agreement': self._calculate_agent_agreement(agent_predictions),
-                'reranking_impact': self._calculate_reranking_impact(final_ranked_faqs, all_candidates=list(agent_predictions.values()))
+        # Use provided processing time or calculate from start_time
+        if processing_time is None:
+            processing_time = time.time() - self.start_time if hasattr(self, 'start_time') else 0
+        
+        if self.external_memory:
+            # Use the external memory system
+            agent_performance_data = {}
+            for agent_name, predictions in agent_predictions.items():
+                agent_performance_data[agent_name] = {
+                    "latency": 0.0,  # Would need to track per-agent timing
+                    "success": len(predictions) > 0,
+                    "predictions": predictions,
+                    "contribution": 1.0 if any(faq in [f for f, _ in final_ranked_faqs[:3]] for faq, _ in predictions[:3]) else 0.0
+                }
+            
+            reranker_performance_data = {}
+            for reranker_name, results in reranker_results.items():
+                reranker_performance_data[reranker_name] = {
+                    "latency": 0.0,  # Would need to track per-reranker timing
+                    "impact": 0.5  # Placeholder value
+                }
+            
+            self.external_memory.record_mapping(
+                original_query=original_query,
+                expanded_query=expanded_query,
+                ranked_faqs=final_ranked_faqs[:5],  # Store top 5 results
+                agent_performance=agent_performance_data,
+                reranker_performance=reranker_performance_data,
+                workflow_info={
+                    'processing_time': processing_time,
+                    'query_expansion_successful': original_query != expanded_query,
+                    'agent_agreement': self._calculate_agent_agreement(agent_predictions),
+                    'reranking_impact': self._calculate_reranking_impact(final_ranked_faqs, list(agent_predictions.values()))
+                }
+            )
+        else:
+            # Use the internal memory dictionary
+            # Original code for updating internal memory
+            mapping_record = {
+                'timestamp': datetime.now().isoformat(),
+                'original_query': original_query,
+                'expanded_query': expanded_query,
+                'final_ranked_faqs': final_ranked_faqs[:5],  # Store top 5 results
+                'best_performing_agents': self._identify_best_agents(final_ranked_faqs, agent_predictions),
+                'workflow_pattern': {
+                    'query_expansion_successful': original_query != expanded_query,
+                    'agent_agreement': self._calculate_agent_agreement(agent_predictions),
+                    'reranking_impact': self._calculate_reranking_impact(final_ranked_faqs, all_candidates=list(agent_predictions.values()))
+                }
             }
-        }
-        
-        # Add to memory
-        self.memory['successful_mappings'].append(mapping_record)
-        
-        # Update workflow patterns
-        self._update_workflow_patterns(mapping_record)
-        
-        # Save memory to disk
-        try:
-            with open("faq_mapping_memory.json", 'w') as f:
-                json.dump(self.memory, f)
-        except Exception as e:
-            logger.error(f"Error saving memory: {e}")
+            
+            # Add to memory
+            self.memory['successful_mappings'].append(mapping_record)
+            
+            # Update workflow patterns
+            self._update_workflow_patterns(mapping_record)
+            
+            # Save memory to disk
+            try:
+                with open("faq_mapping_memory.json", 'w') as f:
+                    json.dump(self.memory, f)
+            except Exception as e:
+                logger.error(f"Error saving memory: {e}")
     
     def _identify_best_agents(self, final_ranked_faqs, agent_predictions):
         """
@@ -1037,254 +1102,6 @@ class EnhancedMultiAgentFAQMapper:
         
         return sum(reciprocal_ranks) / len(reciprocal_ranks)
 
-class JudgeAgent:
-    """
-    A specialized judge agent for reranking FAQ candidates.
-    """
-    
-    def __init__(self, faqs_df, test_df=None):
-        """
-        Initialize the judge agent.
-        
-        Args:
-            faqs_df: DataFrame containing the FAQs with 'question' and 'answer' columns
-            test_df: Optional DataFrame containing example mappings for few-shot learning
-        """
-        self.faqs_df = faqs_df
-        self.test_df = test_df
-    
-    def rerank_candidates(self, utterance, candidates, agent_name_to_predictions=None):
-        """
-        Rerank the candidate FAQs using multi-dimensional evaluation.
-        
-        Args:
-            utterance: The user query
-            candidates: List of (FAQ, score) tuples
-            agent_name_to_predictions: Optional dictionary of agent_name -> list of (FAQ, score) tuples
-            
-        Returns:
-            A list of tuples containing (FAQ title, relevance score)
-        """
-        # Deduplicate candidates
-        unique_candidates = []
-        seen = set()
-        for faq, score in candidates:
-            if faq not in seen:
-                unique_candidates.append((faq, score))
-                seen.add(faq)
-        
-        # If we have 5 or fewer unique candidates, return them
-        if len(unique_candidates) <= 5:
-            return sorted(unique_candidates, key=lambda x: x[1], reverse=True)
-        
-        # Create a prompt for the LLM judge
-        prompt = self._create_judge_prompt(utterance, unique_candidates, agent_name_to_predictions)
-        
-        try:
-            # Call the LLM API
-            response = openai.ChatCompletion.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": self._get_system_message()},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=1024,
-                response_format={"type": "json_object"}
-            )
-            
-            # Parse the response to get reranked FAQs
-            reranked_faqs = self._parse_judge_response(response.choices[0].message.content)
-            
-            return reranked_faqs
-        except Exception as e:
-            logger.error(f"Error calling judge API: {e}")
-            # Fall back to simple aggregation if the judge fails
-            sorted_candidates = sorted(unique_candidates, key=lambda x: x[1], reverse=True)
-            return sorted_candidates[:5]
-    
-    def _get_system_message(self):
-        """
-        Get the system message for the judge agent.
-        
-        Returns:
-            A string containing the system message
-        """
-        return """You are an expert judge of FAQ relevance for banking applications. 
-Your task is to carefully analyze user utterances and determine which FAQs best address their needs.
-You must evaluate FAQs across multiple dimensions:
-1. Semantic Relevance: How well the FAQ matches the language of the query
-2. Intent Matching: How well the FAQ addresses the user's underlying intent
-3. Completeness: How completely the FAQ addresses all aspects of the query
-4. Coherence: How well the FAQ provides a clear and coherent answer
-
-Be precise and thorough in your analysis, as banking customers depend on accurate information.
-Always consider both the semantic similarity and the practical relevance of each FAQ to the user's query.
-When a user is asking about financial products, security features, or account management, prioritize exact matches.
-You must return your rankings in proper JSON format with detailed reasoning for each decision."""
-    
-    def _create_judge_prompt(self, utterance, candidates, agent_name_to_predictions=None):
-        """
-        Create a prompt for the LLM judge to rerank the candidates.
-        
-        Args:
-            utterance: The user query
-            candidates: List of (FAQ, score) tuples
-            agent_name_to_predictions: Optional dictionary of agent_name -> list of (FAQ, score) tuples
-            
-        Returns:
-            A prompt string for the LLM judge
-        """
-        # Create the instructions
-        instructions = """
-Analyze the user query and rank the candidate FAQs across four dimensions:
-1. Semantic Relevance (0-25 points): How well the FAQ matches the language of the query
-2. Intent Matching (0-25 points): How well the FAQ addresses the user's underlying intent
-3. Completeness (0-25 points): How completely the FAQ addresses all aspects of the query
-4. Coherence (0-25 points): How well the FAQ provides a clear and coherent answer
-
-The total relevance score is the sum of these four dimensions (maximum 100 points).
-
-Your response must be in JSON format:
-{
-    "reranked_faqs": [
-        {
-            "faq": "FAQ Title",
-            "semantic_relevance": 20,
-            "intent_matching": 22,
-            "completeness": 18,
-            "coherence": 23,
-            "total_score": 83,
-            "reasoning": "Your reasoning for this ranking"
-        },
-        ...
-    ]
-}
-
-Return exactly 5 FAQs, ranked by total relevance to the user's query. If there are fewer than 5 FAQs, return all of them.
-"""
-
-        # Add the user utterance
-        utterance_text = f"\nUser Query: \"{utterance}\"\n"
-        
-        # Add the candidate FAQs
-        candidates_text = "Candidate FAQs:\n"
-        for i, (faq, score) in enumerate(candidates, 1):
-            candidates_text += f"{i}. {faq} - Original Score: {score:.2f}\n"
-        
-        # Add agent predictions if available
-        agent_text = ""
-        if agent_name_to_predictions:
-            agent_text = "\nPredictions from individual agents:\n"
-            for agent_name, predictions in agent_name_to_predictions.items():
-                agent_text += f"\n{agent_name}:\n"
-                for i, (faq, score) in enumerate(predictions[:3], 1):  # Show top 3 from each agent
-                    agent_text += f"{i}. {faq} - Score: {score:.2f}\n"
-        
-        # Add some examples from the test set as context if available
-        examples_text = ""
-        if self.test_df is not None:
-            examples_text = "\nExamples from previous mappings:\n"
-            few_shot_examples = self.test_df.head(3)  # Get just 3 examples to keep the prompt concise
-            for _, example in few_shot_examples.iterrows():
-                examples_text += f"Query: \"{example['utterance']}\"\n"
-                examples_text += f"Best FAQ: \"{example['FAQ']}\"\n\n"
-        
-        # Add FAQ context information for the candidates
-        faq_context = "\nFAQ Details:\n"
-        
-        # Collect all candidate FAQ titles
-        candidate_faq_titles = [faq for faq, _ in candidates]
-        
-        # Look up FAQ descriptions/answers if available
-        if 'answer' in self.faqs_df.columns:
-            for _, row in self.faqs_df[self.faqs_df['question'].isin(candidate_faq_titles)].iterrows():
-                faq_context += f"FAQ: \"{row['question']}\"\n"
-                # Truncate very long answers
-                answer = row['answer']
-                if len(answer) > 200:
-                    answer = answer[:200] + "..."
-                faq_context += f"Answer: {answer}\n\n"
-        
-        # Combine all parts into the final prompt
-        full_prompt = instructions + utterance_text + candidates_text + agent_text + examples_text + faq_context
-        
-        return full_prompt
-    
-    def _parse_judge_response(self, response_text):
-        """
-        Parse the LLM judge's response to extract reranked FAQs.
-        
-        Args:
-            response_text: The text response from the LLM judge
-            
-        Returns:
-            A list of tuples containing (FAQ title, relevance score)
-        """
-        try:
-            # Parse the JSON
-            result = json.loads(response_text)
-            
-            # Extract the reranked FAQs
-            reranked_faqs = []
-            for item in result.get('reranked_faqs', []):
-                faq = item.get('faq', '')
-                score = item.get('total_score', 0)
-                reranked_faqs.append((faq, score))
-            
-            # Sort by score in descending order
-            reranked_faqs.sort(key=lambda x: x[1], reverse=True)
-            
-            return reranked_faqs
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing judge response JSON: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Error parsing judge response: {e}")
-            return []
-    
-    def explain_rankings(self, utterance, ranked_faqs):
-        """
-        Generate a human-readable explanation of why the FAQs were ranked in this order.
-        
-        Args:
-            utterance: The user query
-            ranked_faqs: List of (FAQ, score) tuples after reranking
-            
-        Returns:
-            A string containing the explanation
-        """
-        if not ranked_faqs:
-            return "No relevant FAQs were found for your query."
-        
-        # Create a prompt for the explanation
-        prompt = f"""
-For the user query: "{utterance}"
-
-You've ranked the following FAQs:
-{chr(10).join([f"{i+1}. {faq} - Score: {score}" for i, (faq, score) in enumerate(ranked_faqs)])}
-
-Please provide a brief, user-friendly explanation of why these FAQs were ranked in this order. 
-Explain how they address the user's query and why the top-ranked FAQ is most relevant.
-"""
-
-        try:
-            # Call the LLM API
-            response = openai.ChatCompletion.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": "You are an expert in explaining FAQ rankings in a helpful, conversational way."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,  # Higher temperature for more natural language
-                max_tokens=300
-            )
-            
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Error generating explanation: {e}")
-            return "These FAQs have been ranked based on their relevance to your query, with the most directly applicable one listed first."
-
 class QueryPlanningAgent:
     """
     A specialized agent for query planning and expansion.
@@ -1467,13 +1284,6 @@ def main():
     
     if 'response' in result and 'response' in result['response']:
         print(f"\nGenerated Response: {result['response']['response']}")
-    
-    # Example: Evaluate on a small subset of the test set
-    # results_df, metrics = mapper.evaluate(num_samples=10)
-    
-    # Example: Process a small subset of the training data
-    # small_training_df = training_df.head(20)
-    # processed_df = mapper.process_dataset(small_training_df, batch_size=5)
 
 if __name__ == "__main__":
     main()

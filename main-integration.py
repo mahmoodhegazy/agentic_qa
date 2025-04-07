@@ -7,7 +7,7 @@ import logging
 from typing import Dict, List, Tuple, Any, Optional
 import argparse
 
-# Import our components
+# Import our components - ensure file names match
 from enhanced_faq_mapper import EnhancedMultiAgentFAQMapper
 from memory_system import MemorySystem
 from multi_agent_orchestrator import MultiAgentOrchestrator
@@ -84,12 +84,14 @@ class FAQMappingSystem:
             judge_consistency=use_self_improvement
         )
         
-        # Initialize enhanced multi-agent system
+        # Initialize enhanced multi-agent system - pass the judge agent and memory system
         self.faq_mapper = EnhancedMultiAgentFAQMapper(
             faqs_df=self.faqs_df,
             test_df=self.test_df,
             use_memory=use_memory,
-            use_self_improvement=use_self_improvement
+            use_self_improvement=use_self_improvement,
+            judge_agent=self.judge_agent,
+            memory_system=self.memory_system
         )
         
         # Initialize evaluation framework
